@@ -45,6 +45,14 @@
   .seg button[aria-pressed="true"]{background:var(--ink);color:var(--ground)}
   .val{font-weight:700;font-variant-numeric:tabular-nums;min-width:5.5ch;text-align:right}
   input[type=range]{width:100%;accent-color:var(--accent);min-height:36px}
+  .dirs{grid-column:1/-1;border-top:1px solid var(--line);padding-top:8px}
+  .dirs summary{cursor:pointer;font-weight:600;color:var(--muted);font-size:14px;list-style:none}
+  .dirs summary::before{content:'▸ ';}
+  .dirs[open] summary::before{content:'▾ ';}
+  .dirs ol{margin:8px 0 0;padding-left:22px;max-height:32vh;overflow-y:auto;font-size:14px;line-height:1.5}
+  .dirs li small{color:var(--muted);margin-left:6px;font-variant-numeric:tabular-nums}
+  .arrow{color:#fff;font-size:14px;line-height:14px;width:14px;height:14px;text-align:center;
+    text-shadow:0 0 2px #d93a5a,0 0 2px #d93a5a,0 0 3px #d93a5a}
   .leaflet-container{font:inherit}
   .you{width:16px;height:16px;border-radius:50%;background:#1a73e8;
     border:3px solid #fff;box-shadow:0 0 0 2px rgba(26,115,232,.35)}
@@ -55,7 +63,7 @@
 <div class="sheet">
   <div class="stat" id="stat">—<small>finding you…</small></div>
   <div class="btns">
-    <button class="alt" id="center" type="button" disabled>Centre</button>
+    <button class="alt" id="locate" type="button">Locate</button>
     <button id="shuffle" type="button" disabled>New loop</button>
   </div>
   <div class="ctl">
@@ -67,221 +75,290 @@
     <span class="val" id="targetVal">10 min</span>
   </div>
   <div class="msg" id="msg">Allow location access when asked.</div>
+  <details class="dirs" id="dirs" hidden>
+    <summary>Directions</summary>
+    <ol id="dirList"></ol>
+  </details>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 (function(){
   var PACE_M_PER_MIN = 80;   // ~4.8 km/h, easy walking pace
-  // Target set by the slider: minutes (10..120, step 10) or km (1..15, step 1).
-  var mode = 'min', minutes = 10, km = 1;
-  function TARGET(){ return mode==='min' ? minutes*PACE_M_PER_MIN : km*1000; } // metres
   // Car profile = real streets only. No footpaths, parks, tracks or stairs.
-  var ROUTER = 'https://routing.openstreetmap.de/routed-car/route/v1/driving/';
-  // Reject a loop if any leg runs along one of these (or an unnamed way).
-  var LANE_RE = /\b(lane|laneway|ln|alley|alleyway|walk|path|track|arcade|steps|driveway)\.?$/i;
+  var OSRM   = 'https://routing.openstreetmap.de/routed-car/';
+  var ROUTE  = OSRM+'route/v1/driving/';
+  var NEAREST= OSRM+'nearest/v1/driving/';
+  // Never snap to, or walk along, one of these (or an unnamed way).
+  var LANE_RE = /\b(lane|laneway|ln|alley|alleyway|walk|path|track|arcade|steps|driveway|access)\.?$/i;
+  var RING_PTS = 4;           // waypoints on the ring besides the start
 
-  var stat = document.getElementById('stat');
-  var msg  = document.getElementById('msg');
-  var btnShuffle = document.getElementById('shuffle');
-  var btnCenter  = document.getElementById('center');
-  var slider = document.getElementById('target');
-  var sliderVal = document.getElementById('targetVal');
-  var btnMin = document.getElementById('modeMin');
-  var btnKm  = document.getElementById('modeKm');
+  // Target set by the slider: minutes (10..120, step 10) or km (1..15, step 1).
+  var mode='min', minutes=10, km=1;
+  try{ var saved=JSON.parse(localStorage.getItem('loop')||'{}');
+       if(saved.mode) mode=saved.mode; if(saved.minutes) minutes=saved.minutes; if(saved.km) km=saved.km; }catch(e){}
+  function TARGET(){ return mode==='min' ? minutes*PACE_M_PER_MIN : km*1000; } // metres
+  function remember(){ try{ localStorage.setItem('loop',JSON.stringify({mode:mode,minutes:minutes,km:km})); }catch(e){} }
 
-  function setMode(m){
-    mode=m;
-    btnMin.setAttribute('aria-pressed', m==='min');
-    btnKm.setAttribute('aria-pressed', m==='km');
-    if(m==='min'){ slider.min=10; slider.max=120; slider.step=10; slider.value=minutes; }
-    else         { slider.min=1;  slider.max=15;  slider.step=1;  slider.value=km; }
-    showTarget();
-  }
-  function showTarget(){
-    sliderVal.textContent = mode==='min' ? minutes+' min' : km+' km';
-  }
-  function readSlider(){
-    var v=Number(slider.value);
-    if(mode==='min') minutes=v; else km=v;
-    showTarget();
-  }
+  var $=function(id){return document.getElementById(id);};
+  var stat=$('stat'), msg=$('msg'), btnShuffle=$('shuffle'), btnLocate=$('locate');
+  var slider=$('target'), sliderVal=$('targetVal'), btnMin=$('modeMin'), btnKm=$('modeKm');
+  var dirs=$('dirs'), dirList=$('dirList');
 
   var map = L.map('map',{zoomControl:false}).setView([-33.87,151.21],15);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{
     maxZoom:19, attribution:'&copy; OpenStreetMap contributors'
   }).addTo(map);
 
-  var here=null, youMarker=null, routeLine=null, startMarker=null, busy=false, queued=false;
+  var here=null, start=null, youMarker=null, routeLine=null, joinLine=null,
+      startMarker=null, arrows=[], busy=false, queued=false;
 
   function say(t,err){ msg.textContent=t; msg.className='msg'+(err?' err':''); }
-  function showStat(m,min){
-    stat.innerHTML = (m/1000).toFixed(2)+' km<small>≈ '+min+' min there and back</small>';
+  function showStat(m){
+    stat.innerHTML=(m/1000).toFixed(2)+' km<small>≈ '+Math.round(m/PACE_M_PER_MIN)+' min loop</small>';
   }
 
-  // Destination point given start, bearing (deg) and distance (m).
+  // ---------- slider / mode ----------
+  function setMode(m){
+    mode=m;
+    btnMin.setAttribute('aria-pressed', m==='min');
+    btnKm.setAttribute('aria-pressed', m==='km');
+    if(m==='min'){ slider.min=10; slider.max=120; slider.step=10; slider.value=minutes; }
+    else         { slider.min=1;  slider.max=15;  slider.step=1;  slider.value=km; }
+    showTarget(); remember();
+  }
+  function showTarget(){ sliderVal.textContent = mode==='min' ? minutes+' min' : km+' km'; }
+  function readSlider(){
+    var v=Number(slider.value);
+    if(mode==='min') minutes=v; else km=v;
+    showTarget(); remember();
+  }
+
+  // ---------- geo helpers ----------
   function dest(lat,lon,brg,d){
     var R=6371000, b=brg*Math.PI/180, p1=lat*Math.PI/180, l1=lon*Math.PI/180, ad=d/R;
     var p2=Math.asin(Math.sin(p1)*Math.cos(ad)+Math.cos(p1)*Math.sin(ad)*Math.cos(b));
     var l2=l1+Math.atan2(Math.sin(b)*Math.sin(ad)*Math.cos(p1),Math.cos(ad)-Math.sin(p1)*Math.sin(p2));
     return [p2*180/Math.PI, l2*180/Math.PI];
   }
+  function bearing(a,b){
+    var p1=a[0]*Math.PI/180,p2=b[0]*Math.PI/180,dl=(b[1]-a[1])*Math.PI/180;
+    var y=Math.sin(dl)*Math.cos(p2), x=Math.cos(p1)*Math.sin(p2)-Math.sin(p1)*Math.cos(p2)*Math.cos(dl);
+    return (Math.atan2(y,x)*180/Math.PI+360)%360;
+  }
+  function metres(a,b){ return map.distance(a,b); }
 
-  function fetchRoute(pts){
-    var coords = pts.map(function(p){return p[1]+','+p[0];}).join(';');
-    return fetch(ROUTER+coords+'?overview=full&geometries=geojson&steps=true&continue_straight=true')
-      .then(function(r){ if(!r.ok) throw new Error('router '+r.status); return r.json(); })
-      .then(function(j){ if(!j.routes||!j.routes[0]) throw new Error('no route'); return j.routes[0]; });
+  // ---------- OSRM ----------
+  function getJSON(url){
+    return fetch(url).then(function(r){ if(!r.ok) throw new Error('router '+r.status); return r.json(); });
+  }
+  function goodName(n){ n=(n||'').trim(); return n!=='' && !LANE_RE.test(n); }
+
+  // Nearest point on a *named street* (skips lanes, alleys, unnamed ways).
+  function nearestStreet(pt){
+    return getJSON(NEAREST+pt[1]+','+pt[0]+'?number=10').then(function(j){
+      var w=(j.waypoints||[]);
+      var pick=null;
+      for(var i=0;i<w.length;i++){ if(goodName(w[i].name)){ pick=w[i]; break; } }
+      if(!pick) throw new Error('no street nearby');
+      return {lat:pick.location[1], lon:pick.location[0], name:pick.name};
+    });
+  }
+  function routeVia(pts, bearings){
+    var coords=pts.map(function(p){return p[1]+','+p[0];}).join(';');
+    var q='?overview=full&geometries=geojson&steps=true&continue_straight=true';
+    if(bearings) q+='&bearings='+bearings.join(';');
+    return getJSON(ROUTE+coords+q).then(function(j){
+      if(j.code!=='Ok'||!j.routes||!j.routes[0]) throw new Error(j.code||'no route');
+      return j.routes[0];
+    });
   }
 
-  // Full street geometry, stitched from every step (never a simplified overview).
+  // Full street geometry, stitched from every step.
   function routeLatLngs(route){
     var out=[], last=null;
-    route.legs.forEach(function(leg){
-      leg.steps.forEach(function(st){
-        (st.geometry.coordinates||[]).forEach(function(c){
-          var k=c[0].toFixed(6)+','+c[1].toFixed(6);
-          if(k!==last){ out.push([c[1],c[0]]); last=k; }
-        });
+    route.legs.forEach(function(leg){ leg.steps.forEach(function(st){
+      (st.geometry.coordinates||[]).forEach(function(c){
+        var k=c[0].toFixed(6)+','+c[1].toFixed(6);
+        if(k!==last){ out.push([c[1],c[0]]); last=k; }
       });
-    });
+    });});
     return out;
   }
-
-  // True if any street segment is walked twice (out-and-back spur, or retracing).
-  function doublesBack(latlngs){
+  // True if any street segment is walked twice (spur or retrace).
+  function doublesBack(ll){
     var seen={};
-    for(var i=1;i<latlngs.length;i++){
-      var a=latlngs[i-1].join(','), b=latlngs[i].join(',');
-      var key = a<b ? a+'|'+b : b+'|'+a;
-      if(seen[key]) return true;
-      seen[key]=1;
+    for(var i=1;i<ll.length;i++){
+      var a=ll[i-1].join(','), b=ll[i].join(','), key=a<b?a+'|'+b:b+'|'+a;
+      if(seen[key]) return true; seen[key]=1;
     }
     return false;
   }
-
-  // True if the route touches a lane, alley or unnamed way.
   function usesLanes(route){
-    return route.legs.some(function(leg){
-      return leg.steps.some(function(st){
-        if(st.maneuver && st.maneuver.type==='arrive') return false;
-        var n=(st.name||'').trim();
-        return n==='' || LANE_RE.test(n);
-      });
-    });
+    return route.legs.some(function(leg){ return leg.steps.some(function(st){
+      if(st.maneuver && st.maneuver.type==='arrive') return false;
+      return !goodName(st.name);
+    });});
   }
 
-  // Loop: a ring of waypoints on a circle that passes through the start,
-  // pushed off in a random heading. Route start -> ring -> start.
-  // Reject anything that walks a segment twice or touches a lane; grow or
-  // shrink the ring until the on-street distance is >= target (never under).
-  var RING_PTS = 4;   // waypoints besides the start
-  function ringPoints(heading, R){
-    var c = dest(here[0],here[1],heading,R);          // circle centre
-    var back = heading+180;                            // bearing centre -> start
-    var pts=[here];
-    for(var k=1;k<=RING_PTS;k++){
-      pts.push(dest(c[0],c[1], back + k*360/(RING_PTS+1), R));
-    }
-    pts.push(here);
+  // ---------- loop building ----------
+  // Ring of waypoints on a circle through the start, tangent to the street
+  // direction d at the start, so you leave one way and come home the other.
+  function ringPoints(S, d, side, R){
+    var C=dest(S[0],S[1], d+side*90, R);
+    var th0=d-side*90;                      // bearing C -> S
+    var pts=[];
+    for(var k=1;k<=RING_PTS;k++) pts.push(dest(C[0],C[1], th0+side*k*360/(RING_PTS+1), R));
     return pts;
   }
 
   function buildLoop(){
-    if(!here) return;
-    if(busy){ queued=true; return; }   // slider moved mid-build: rebuild after
+    if(!start) return;
+    if(busy){ queued=true; return; }
     busy=true; btnShuffle.disabled=true;
     say('Plotting a loop…');
-    var T=TARGET();
-    var headingTries=0;
+    var T=TARGET(), S=[start.lat,start.lon], tries=0;
 
     function tryHeading(){
-      headingTries++;
-      var heading=Math.random()*360;
-      var R=T/(2*Math.PI)/1.25;     // circumference ≈ T; streets add ~25%
-      var attempt=0, best=null;     // best = shortest clean route that is >= T
-
-      function tryOnce(){
-        attempt++;
-        return fetchRoute(ringPoints(heading,R)).then(function(route){
-          var ll=routeLatLngs(route);
-          var clean = !usesLanes(route) && !doublesBack(ll);
-          var d=route.distance;
-          if(clean && d>=T && (!best||d<best.distance)) best={route:route,latlngs:ll};
-          if(clean && d>=T && d<=T*1.3) return best;    // good enough, stop
-          if(attempt>=3) return best;
-          R = R*(T*1.08/Math.max(d,50));                 // aim slightly over
-          return tryOnce();
-        });
-      }
-      return tryOnce();
+      tries++;
+      var side = Math.random()<0.5?1:-1;
+      var R=T/(2*Math.PI)/1.25;      // circumference ≈ T; streets add ~25%
+      // probe: which way does the street run here, given a random nudge?
+      var probe=dest(S[0],S[1], Math.random()*360, 150);
+      return routeVia([S,probe]).then(function(r){
+        var d=r.legs[0].steps[0].maneuver.bearing_after;
+        var attempt=0, best=null;
+        function tryOnce(){
+          attempt++;
+          return Promise.all(ringPoints(S,d,side,R).map(nearestStreet)).then(function(ws){
+            var pts=[S].concat(ws.map(function(w){return [w.lat,w.lon];})).concat([S]);
+            var b=[d+',60']; for(var i=0;i<ws.length;i++) b.push(''); b.push(d+',60');
+            return routeVia(pts,b);
+          }).then(function(route){
+            var ll=routeLatLngs(route), dist=route.distance;
+            var clean=!usesLanes(route)&&!doublesBack(ll);
+            if(clean&&dist>=T&&(!best||dist<best.route.distance)) best={route:route,latlngs:ll};
+            if(clean&&dist>=T&&dist<=T*1.3) return best;
+            if(attempt>=3) return best;
+            R=R*(T*1.08/Math.max(dist,50));
+            return tryOnce();
+          });
+        }
+        return tryOnce();
+      }).catch(function(e){ console.warn('heading failed',e); return null; });
     }
-
     function go(){
       return tryHeading().then(function(b){
         if(b){ draw(b.route,b.latlngs); return; }
-        if(headingTries<6) return go();
+        if(tries<6) return go();
         say('No clean street loop found here. Tap New loop to try again.', true);
       });
     }
-    go().catch(function(e){
-      say('Routing failed. Check signal and tap New loop.', true);
-      console.error(e);
-    }).finally(function(){
-      busy=false; btnShuffle.disabled=false;
-      if(queued){ queued=false; buildLoop(); }
-    });
+    go().catch(function(e){ say('Routing failed. Check signal and tap New loop.',true); console.error(e); })
+        .finally(function(){ busy=false; btnShuffle.disabled=false; if(queued){queued=false; buildLoop();} });
   }
 
-  var joinLine=null;
-  function draw(route, latlngs){
-    if(routeLine) map.removeLayer(routeLine);
-    if(joinLine) map.removeLayer(joinLine);
-    routeLine = L.polyline(latlngs,{color:'#d93a5a',weight:6,opacity:.9,lineJoin:'round',smoothFactor:0}).addTo(map);
-    // dashed tie from where you stand to the street where the loop starts/ends
-    joinLine = L.polyline([here, latlngs[0], latlngs[latlngs.length-1], here],
-      {color:'#d93a5a',weight:3,opacity:.7,dashArray:'4 8'}).addTo(map);
-    if(startMarker) map.removeLayer(startMarker);
-    startMarker = L.circleMarker(latlngs[0],{radius:8,color:'#fff',weight:3,fillColor:'#2f7d4f',fillOpacity:1})
-      .addTo(map).bindTooltip('Start / finish',{permanent:false});
-    map.fitBounds(routeLine.getBounds(),{padding:[30,30]});
-    showStat(route.distance, Math.round(route.distance/PACE_M_PER_MIN));
-    say('One-way loop, streets only, never under target. Dashed line joins you to the start.');
+  // ---------- drawing ----------
+  function clearRoute(){
+    [routeLine,joinLine,startMarker].forEach(function(l){ if(l) map.removeLayer(l); });
+    arrows.forEach(function(a){ map.removeLayer(a); }); arrows=[];
+    routeLine=joinLine=startMarker=null;
   }
-
-  function onPos(p){
-    var first = !here;
-    here=[p.coords.latitude,p.coords.longitude];
-    if(!youMarker){
-      youMarker=L.marker(here,{icon:L.divIcon({className:'',html:'<div class="you"></div>',iconSize:[16,16],iconAnchor:[8,8]}),
-        interactive:false}).addTo(map);
-    } else youMarker.setLatLng(here);
-    if(first){
-      map.setView(here,16);
-      btnShuffle.disabled=false; btnCenter.disabled=false;
-      buildLoop();
+  function draw(route, ll){
+    clearRoute();
+    routeLine=L.polyline(ll,{color:'#d93a5a',weight:6,opacity:.9,lineJoin:'round',smoothFactor:0}).addTo(map);
+    joinLine=L.polyline([here, ll[0]],{color:'#d93a5a',weight:3,opacity:.7,dashArray:'4 8'}).addTo(map);
+    startMarker=L.circleMarker(ll[0],{radius:8,color:'#fff',weight:3,fillColor:'#2f7d4f',fillOpacity:1})
+      .addTo(map).bindTooltip('Start / finish on '+start.name);
+    // direction arrows every ~1/8 of the loop
+    var total=route.distance, step=total/8, next=step/2, acc=0;
+    for(var i=1;i<ll.length;i++){
+      var seg=metres(ll[i-1],ll[i]);
+      while(acc+seg>=next && next<total){
+        var f=(next-acc)/seg, p=[ll[i-1][0]+(ll[i][0]-ll[i-1][0])*f, ll[i-1][1]+(ll[i][1]-ll[i-1][1])*f];
+        arrows.push(L.marker(p,{interactive:false,icon:L.divIcon({className:'',iconSize:[14,14],iconAnchor:[7,7],
+          html:'<div class="arrow" style="transform:rotate('+bearing(ll[i-1],ll[i])+'deg)">&#9650;</div>'})}).addTo(map));
+        next+=step;
+      }
+      acc+=seg;
     }
+    map.fitBounds(routeLine.getBounds(),{padding:[30,30]});
+    showStat(total);
+    listDirections(route);
+    say('Loop starts on '+start.name+'. Follow the arrows. Streets only, never under target.');
   }
+
+  function listDirections(route){
+    var items=[], legs=route.legs;
+    legs.forEach(function(leg,li){ leg.steps.forEach(function(st){
+      var t=st.maneuver.type, m=st.maneuver.modifier||'', n=st.name||'street', text=null;
+      if(t==='arrive') { if(li===legs.length-1) text='Back at start'; else return; }
+      else if(t==='depart'){ if(li>0) return; text='Head off along '+n; }
+      else if(t==='roundabout'||t==='rotary') text='Roundabout, exit '+(st.maneuver.exit||'')+' onto '+n;
+      else if(/left|right/.test(m)) text=(m.charAt(0).toUpperCase()+m.slice(1)).replace('_',' ')+' onto '+n;
+      else text='Continue onto '+n;
+      var last=items[items.length-1];
+      if(last && /^(Continue|Head)/.test(text) && last.name===n){ last.dist+=st.distance; return; }
+      items.push({text:text,name:n,dist:st.distance});
+    });});
+    dirList.innerHTML='';
+    items.forEach(function(it){
+      var li=document.createElement('li'); li.textContent=it.text;
+      if(it.dist>0){ var sm=document.createElement('small'); sm.textContent=Math.round(it.dist)+' m'; li.appendChild(sm); }
+      dirList.appendChild(li);
+    });
+    dirs.hidden=false;
+  }
+
+  // ---------- location ----------
+  function placeYou(){
+    if(!youMarker){
+      youMarker=L.marker(here,{interactive:false,icon:L.divIcon({className:'',html:'<div class="you"></div>',iconSize:[16,16],iconAnchor:[8,8]})}).addTo(map);
+    } else youMarker.setLatLng(here);
+  }
+  function onWatch(p){ here=[p.coords.latitude,p.coords.longitude]; placeYou(); }
   function onErr(e){
-    var t = e.code===1 ? 'Location blocked. Allow location for this site in your browser settings, then reload.'
-          : 'Could not get your location. Move somewhere with better signal and reload.';
-    say(t,true); stat.innerHTML='—<small>no location</small>';
+    say(e.code===1 ? 'Location blocked. Allow location for this site in your browser settings, then tap Locate.'
+                   : 'Could not get your location. Move somewhere with better signal and tap Locate.', true);
+    stat.innerHTML='—<small>no location</small>';
+    btnLocate.disabled=false;
   }
+  // Fresh fix, snap to nearest named street, then build.
+  function locate(){
+    btnLocate.disabled=true; say('Finding you…'); stat.innerHTML='—<small>finding you…</small>';
+    navigator.geolocation.getCurrentPosition(function(p){
+      here=[p.coords.latitude,p.coords.longitude]; placeYou();
+      map.setView(here,16);
+      nearestStreet(here).then(function(s){
+        start=s; btnShuffle.disabled=false; btnLocate.disabled=false;
+        buildLoop();
+      }).catch(function(e){
+        say('No named street near you. Move closer to a road and tap Locate.',true);
+        btnLocate.disabled=false; console.error(e);
+      });
+    }, onErr, {enableHighAccuracy:true, timeout:20000, maximumAge:0});
+  }
+
+  // keep the screen on while a loop is showing
+  var wake=null;
+  function keepAwake(){
+    if(!('wakeLock' in navigator)) return;
+    navigator.wakeLock.request('screen').then(function(w){ wake=w; }).catch(function(){});
+  }
+  document.addEventListener('visibilitychange',function(){ if(document.visibilityState==='visible'&&wake) keepAwake(); });
 
   if(!navigator.geolocation){ say('This browser has no location support.',true); return; }
-  if(location.protocol!=='https:' && location.hostname!=='localhost'){
-    say('Location needs HTTPS. Open this page over https.',true);
-  }
-  navigator.geolocation.getCurrentPosition(onPos,onErr,{enableHighAccuracy:true,timeout:20000,maximumAge:30000});
-  navigator.geolocation.watchPosition(onPos,function(){},{enableHighAccuracy:true,maximumAge:5000});
+  if(location.protocol!=='https:' && location.hostname!=='localhost') say('Location needs HTTPS.',true);
 
-  btnShuffle.addEventListener('click',buildLoop);
+  btnShuffle.addEventListener('click',function(){ keepAwake(); buildLoop(); });
+  btnLocate.addEventListener('click',function(){ keepAwake(); locate(); });
   slider.addEventListener('input',readSlider);
   slider.addEventListener('change',function(){ readSlider(); buildLoop(); });
   btnMin.addEventListener('click',function(){ setMode('min'); buildLoop(); });
   btnKm.addEventListener('click',function(){ setMode('km'); buildLoop(); });
-  setMode('min');
-  btnCenter.addEventListener('click',function(){ if(here) map.setView(here,17); });
+  setMode(mode);
+  locate();
+  navigator.geolocation.watchPosition(onWatch,function(){},{enableHighAccuracy:true,maximumAge:5000});
 })();
 </script>
 </body>
