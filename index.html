@@ -129,9 +129,35 @@
 
   function fetchRoute(pts){
     var coords = pts.map(function(p){return p[1]+','+p[0];}).join(';');
-    return fetch(ROUTER+coords+'?overview=full&geometries=geojson&steps=true')
+    return fetch(ROUTER+coords+'?overview=full&geometries=geojson&steps=true&continue_straight=true')
       .then(function(r){ if(!r.ok) throw new Error('router '+r.status); return r.json(); })
       .then(function(j){ if(!j.routes||!j.routes[0]) throw new Error('no route'); return j.routes[0]; });
+  }
+
+  // Full street geometry, stitched from every step (never a simplified overview).
+  function routeLatLngs(route){
+    var out=[], last=null;
+    route.legs.forEach(function(leg){
+      leg.steps.forEach(function(st){
+        (st.geometry.coordinates||[]).forEach(function(c){
+          var k=c[0].toFixed(6)+','+c[1].toFixed(6);
+          if(k!==last){ out.push([c[1],c[0]]); last=k; }
+        });
+      });
+    });
+    return out;
+  }
+
+  // True if any street segment is walked twice (out-and-back spur, or retracing).
+  function doublesBack(latlngs){
+    var seen={};
+    for(var i=1;i<latlngs.length;i++){
+      var a=latlngs[i-1].join(','), b=latlngs[i].join(',');
+      var key = a<b ? a+'|'+b : b+'|'+a;
+      if(seen[key]) return true;
+      seen[key]=1;
+    }
+    return false;
   }
 
   // True if the route touches a lane, alley or unnamed way.
@@ -145,38 +171,46 @@
     });
   }
 
-  // Loop: start -> 3 points fanned around a random heading -> start.
-  // Grow/shrink the radius until on-street distance is >= TARGET
-  // (never under 10 min; a bit over is fine). Lanes => new heading.
+  // Loop: a ring of waypoints on a circle that passes through the start,
+  // pushed off in a random heading. Route start -> ring -> start.
+  // Reject anything that walks a segment twice or touches a lane; grow or
+  // shrink the ring until the on-street distance is >= target (never under).
+  var RING_PTS = 4;   // waypoints besides the start
+  function ringPoints(heading, R){
+    var c = dest(here[0],here[1],heading,R);          // circle centre
+    var back = heading+180;                            // bearing centre -> start
+    var pts=[here];
+    for(var k=1;k<=RING_PTS;k++){
+      pts.push(dest(c[0],c[1], back + k*360/(RING_PTS+1), R));
+    }
+    pts.push(here);
+    return pts;
+  }
+
   function buildLoop(){
     if(!here) return;
     if(busy){ queued=true; return; }   // slider moved mid-build: rebuild after
     busy=true; btnShuffle.disabled=true;
     say('Plotting a loop…');
-    var headingTries=0;
     var T=TARGET();
+    var headingTries=0;
 
     function tryHeading(){
       headingTries++;
       var heading=Math.random()*360;
-      var r=T/3.5/1.3;   // straight-line perimeter ≈3.5r; streets add ~30%
-      var attempt=0, best=null;   // best = shortest route that is still >= T
+      var R=T/(2*Math.PI)/1.25;     // circumference ≈ T; streets add ~25%
+      var attempt=0, best=null;     // best = shortest clean route that is >= T
 
       function tryOnce(){
         attempt++;
-        var pts=[here,
-          dest(here[0],here[1],heading-50,r),
-          dest(here[0],here[1],heading,r*1.15),
-          dest(here[0],here[1],heading+50,r),
-          here];
-        return fetchRoute(pts).then(function(route){
-          if(usesLanes(route)) return null;          // give up on this heading
+        return fetchRoute(ringPoints(heading,R)).then(function(route){
+          var ll=routeLatLngs(route);
+          var clean = !usesLanes(route) && !doublesBack(ll);
           var d=route.distance;
-          if(d>=T && (!best||d<best.distance)) best=route;
-          if(d>=T && d<=T*1.3) return best; // good enough, stop
-          if(attempt>=5) return best;
-          // too short: grow; too long: shrink, but aim slightly over target
-          r = r*(T*1.08/Math.max(d,50));
+          if(clean && d>=T && (!best||d<best.distance)) best={route:route,latlngs:ll};
+          if(clean && d>=T && d<=T*1.3) return best;    // good enough, stop
+          if(attempt>=3) return best;
+          R = R*(T*1.08/Math.max(d,50));                 // aim slightly over
           return tryOnce();
         });
       }
@@ -184,10 +218,10 @@
     }
 
     function go(){
-      return tryHeading().then(function(route){
-        if(route){ draw(route); return; }
-        if(headingTries<4) return go();
-        say('No street-only loop found here. Tap New loop to try again.', true);
+      return tryHeading().then(function(b){
+        if(b){ draw(b.route,b.latlngs); return; }
+        if(headingTries<6) return go();
+        say('No clean street loop found here. Tap New loop to try again.', true);
       });
     }
     go().catch(function(e){
@@ -199,16 +233,20 @@
     });
   }
 
-  function draw(route){
-    var latlngs = route.geometry.coordinates.map(function(c){return [c[1],c[0]];});
+  var joinLine=null;
+  function draw(route, latlngs){
     if(routeLine) map.removeLayer(routeLine);
-    routeLine = L.polyline(latlngs,{color:'#d93a5a',weight:6,opacity:.9,lineJoin:'round'}).addTo(map);
+    if(joinLine) map.removeLayer(joinLine);
+    routeLine = L.polyline(latlngs,{color:'#d93a5a',weight:6,opacity:.9,lineJoin:'round',smoothFactor:0}).addTo(map);
+    // dashed tie from where you stand to the street where the loop starts/ends
+    joinLine = L.polyline([here, latlngs[0], latlngs[latlngs.length-1], here],
+      {color:'#d93a5a',weight:3,opacity:.7,dashArray:'4 8'}).addTo(map);
     if(startMarker) map.removeLayer(startMarker);
-    startMarker = L.circleMarker(here,{radius:8,color:'#fff',weight:3,fillColor:'#2f7d4f',fillOpacity:1})
+    startMarker = L.circleMarker(latlngs[0],{radius:8,color:'#fff',weight:3,fillColor:'#2f7d4f',fillOpacity:1})
       .addTo(map).bindTooltip('Start / finish',{permanent:false});
     map.fitBounds(routeLine.getBounds(),{padding:[30,30]});
     showStat(route.distance, Math.round(route.distance/PACE_M_PER_MIN));
-    say('Streets only, never under target. Blue dot is you. Tap New loop for another.');
+    say('One-way loop, streets only, never under target. Dashed line joins you to the start.');
   }
 
   function onPos(p){
