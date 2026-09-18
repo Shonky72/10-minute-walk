@@ -61,7 +61,10 @@
   var MINUTES = 10;
   var PACE_M_PER_MIN = 80;               // ~4.8 km/h, easy walking pace
   var TARGET = MINUTES * PACE_M_PER_MIN;  // metres, out and back
-  var ROUTER = 'https://routing.openstreetmap.de/routed-foot/route/v1/driving/';
+  // Car profile = real streets only. No footpaths, parks, tracks or stairs.
+  var ROUTER = 'https://routing.openstreetmap.de/routed-car/route/v1/driving/';
+  // Reject a loop if any leg runs along one of these (or an unnamed way).
+  var LANE_RE = /\b(lane|laneway|ln|alley|alleyway|walk|path|track|arcade|steps|driveway)\.?$/i;
 
   var stat = document.getElementById('stat');
   var msg  = document.getElementById('msg');
@@ -90,42 +93,67 @@
 
   function fetchRoute(pts){
     var coords = pts.map(function(p){return p[1]+','+p[0];}).join(';');
-    return fetch(ROUTER+coords+'?overview=full&geometries=geojson&steps=false')
+    return fetch(ROUTER+coords+'?overview=full&geometries=geojson&steps=true')
       .then(function(r){ if(!r.ok) throw new Error('router '+r.status); return r.json(); })
       .then(function(j){ if(!j.routes||!j.routes[0]) throw new Error('no route'); return j.routes[0]; });
   }
 
+  // True if the route touches a lane, alley or unnamed way.
+  function usesLanes(route){
+    return route.legs.some(function(leg){
+      return leg.steps.some(function(st){
+        if(st.maneuver && st.maneuver.type==='arrive') return false;
+        var n=(st.name||'').trim();
+        return n==='' || LANE_RE.test(n);
+      });
+    });
+  }
+
   // Loop: start -> 3 points fanned around a random heading -> start.
-  // Iterate radius so the real on-street distance lands near TARGET.
+  // Grow/shrink the radius until on-street distance is >= TARGET
+  // (never under 10 min; a bit over is fine). Lanes => new heading.
   function buildLoop(){
     if(!here||busy) return;
     busy=true; btnShuffle.disabled=true;
     say('Plotting a loop…');
-    var heading = Math.random()*360;
-    var r = TARGET/3.5/1.3;   // straight-line perimeter ≈3.5r; streets add ~30%
-    var attempt=0, best=null;
+    var headingTries=0;
 
-    function tryOnce(){
-      attempt++;
-      var pts=[here,
-        dest(here[0],here[1],heading-50,r),
-        dest(here[0],here[1],heading,r*1.15),
-        dest(here[0],here[1],heading+50,r),
-        here];
-      return fetchRoute(pts).then(function(route){
-        var d=route.distance;
-        if(!best||Math.abs(d-TARGET)<Math.abs(best.distance-TARGET)) best=route;
-        var off=Math.abs(d-TARGET)/TARGET;
-        if(off>0.12 && attempt<4){
-          r = r*(TARGET/Math.max(d,50));
+    function tryHeading(){
+      headingTries++;
+      var heading=Math.random()*360;
+      var r=TARGET/3.5/1.3;   // straight-line perimeter ≈3.5r; streets add ~30%
+      var attempt=0, best=null;   // best = shortest route that is still >= TARGET
+
+      function tryOnce(){
+        attempt++;
+        var pts=[here,
+          dest(here[0],here[1],heading-50,r),
+          dest(here[0],here[1],heading,r*1.15),
+          dest(here[0],here[1],heading+50,r),
+          here];
+        return fetchRoute(pts).then(function(route){
+          if(usesLanes(route)) return null;          // give up on this heading
+          var d=route.distance;
+          if(d>=TARGET && (!best||d<best.distance)) best=route;
+          if(d>=TARGET && d<=TARGET*1.3) return best; // good enough, stop
+          if(attempt>=5) return best;
+          // too short: grow; too long: shrink, but aim slightly over target
+          r = r*(TARGET*1.08/Math.max(d,50));
           return tryOnce();
-        }
-      });
+        });
+      }
+      return tryOnce();
     }
 
-    tryOnce().then(function(){ draw(best); }).catch(function(e){
-      if(best){ draw(best); return; }
-      say('Could not find a walkable route here. Try again.', true);
+    function go(){
+      return tryHeading().then(function(route){
+        if(route){ draw(route); return; }
+        if(headingTries<4) return go();
+        say('No street-only loop found here. Tap New loop to try again.', true);
+      });
+    }
+    go().catch(function(e){
+      say('Routing failed. Check signal and tap New loop.', true);
       console.error(e);
     }).finally(function(){ busy=false; btnShuffle.disabled=false; });
   }
@@ -139,7 +167,7 @@
       .addTo(map).bindTooltip('Start / finish',{permanent:false});
     map.fitBounds(routeLine.getBounds(),{padding:[30,30]});
     showStat(route.distance, Math.round(route.distance/PACE_M_PER_MIN));
-    say('Follow the red line. Blue dot is you. Tap New loop for a different one.');
+    say('Streets only, never under '+MINUTES+' min. Blue dot is you. Tap New loop for another.');
   }
 
   function onPos(p){
